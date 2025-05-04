@@ -1,3 +1,9 @@
-streamlit
-transformers
-torch
+streamlit==1.33.0
+transformers==4.40.1
+sentence-transformers==2.6.1
+torch==2.2.2
+faiss-cpu==1.7.4
+huggingface-hub==0.23.0
+auto-gptq==0.0.4  # Use a newer version
+bitsandbytes==0.39.0
+transformers>=4.30.0
