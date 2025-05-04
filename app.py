@@ -1,105 +1,159 @@
-
 import streamlit as st
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from auto_gptq import AutoGPTQForCausalLM
+from sentence_transformers import SentenceTransformer
+from huggingface_hub import hf_hub_download
 import torch
+import faiss
 import json
 import os
+from uuid import uuid4
 
-st.set_page_config(page_title="Arabic-English Chatbot", layout="wide")
-st.markdown("""<style>.block-container{padding-top:1rem;}</style>""", unsafe_allow_html=True)
+# --- Streamlit Page Config ---
+st.set_page_config(page_title="رفيق", layout="wide")
 
-# Load tokenizer and model
+# --- Styling ---
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Amiri&display=swap');
+    .title-custom {
+        font-family: 'Amiri', serif;
+        font-size: 3.5rem;
+        font-weight: bold;
+        background: -webkit-linear-gradient(lightgreen, lightblue);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.5rem;
+        direction: rtl;
+        text-align: center;
+    }
+    .chat-bubble {
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-radius: 1rem;
+        max-width: 80%;
+        direction: rtl;
+        font-size: 1.1rem;
+        line-height: 1.6;
+    }
+    .chat-user {
+        background-color: #e8f5e9;
+        text-align: right;
+        margin-left: auto;
+    }
+    .chat-bot {
+        background-color: #e3f2fd;
+        text-align: left;
+        margin-right: auto;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- Hugging Face Token ---
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
+# --- Load Resources with Caching ---
+@st.cache_resource
+def load_faiss_and_docs():
+    index_path = hf_hub_download(
+        repo_id="OmniaSh/faiss_data",
+        filename="index.faiss",
+        repo_type="dataset",
+        token=HF_TOKEN
+    )
+    docs_path = hf_hub_download(
+        repo_id="OmniaSh/faiss_data",
+        filename="docs.json",
+        repo_type="dataset",
+        token=HF_TOKEN
+    )
+    index = faiss.read_index(index_path)
+    with open(docs_path, "r", encoding="utf-8") as f:
+        docs = json.load(f)
+    return index, docs
+
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer("intfloat/multilingual-e5-base")
+
 @st.cache_resource
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.1")
     model = AutoModelForCausalLM.from_pretrained(
-        "mistralai/Mistral-7B-Instruct-v0.1",
-        torch_dtype=torch.float16,
-        device_map="auto"
+        "OmniaSh/mistral",
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
     )
-    return tokenizer, model
+    tokenizer = AutoTokenizer.from_pretrained(
+        "OmniaSh/mistral",
+        use_auth_token=HF_TOKEN
+    )
+    return model, tokenizer
 
-tokenizer, model = load_model()
+# --- Ask Function ---
+def ask(question, index, docs, embedder, model, tokenizer, top_k=5, max_new_tokens=200):
+    query_embedding = embedder.encode(question, normalize_embeddings=True)
+    D, I = index.search(query_embedding.reshape(1, -1), top_k)
+    retrieved_chunks = [docs[i] for i in I[0]]
+    context = "\n\n".join(retrieved_chunks)
+    prompt = f"السؤال: {question}\n\nالمحتوى:\n{context}\n\nالإجابة:"
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=True)
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer.split("الإجابة:")[-1].strip()
 
-# Save/load chat history
-HISTORY_FILE = "chat_history.json"
+# --- Chat Session State ---
+if "chats" not in st.session_state:
+    st.session_state.chats = {}
+if "current_chat" not in st.session_state:
+    chat_id = str(uuid4())
+    st.session_state.current_chat = chat_id
+    st.session_state.chats[chat_id] = []
 
-def load_chat_history():
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_chat_history(history):
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
-# Initialize
-if "chat_id" not in st.session_state:
-    st.session_state.chat_id = "Default Chat"
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = load_chat_history()
-
-# Sidebar - Chat management
+# --- Sidebar ---
 with st.sidebar:
-    st.title("🧠 Your Chats")
-    new_chat = st.button("➕ New Chat")
-    if new_chat:
-        new_id = f"Chat {len(st.session_state.chat_history) + 1}"
-        st.session_state.chat_id = new_id
-        st.session_state.chat_history[new_id] = []
-        save_chat_history(st.session_state.chat_history)
+    st.markdown("""
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+            <img src="https://cdn-icons-png.flaticon.com/512/4712/4712109.png" width="40"/>
+        </div>
+    """, unsafe_allow_html=True)
 
-    delete_chat = st.button("🗑️ Delete Current Chat")
-    if delete_chat and st.session_state.chat_id in st.session_state.chat_history:
-        del st.session_state.chat_history[st.session_state.chat_id]
-        st.session_state.chat_id = "Default Chat"
-        save_chat_history(st.session_state.chat_history)
+    if st.button("➕ محادثة جديدة", use_container_width=True):
+        new_chat_id = str(uuid4())
+        st.session_state.chats[new_chat_id] = []
+        st.session_state.current_chat = new_chat_id
+        st.experimental_rerun()
 
-    st.markdown("---")
-    for cid in st.session_state.chat_history.keys():
-        if st.button(cid):
-            st.session_state.chat_id = cid
+    st.markdown("### 💬 سجل المحادثات")
+    for cid in st.session_state.chats:
+        label = f"محادثة {list(st.session_state.chats).index(cid) + 1}"
+        if st.button(label, key=cid):
+            st.session_state.current_chat = cid
+            st.experimental_rerun()
 
-# Message display
-st.title("🤖 Arabic-English Chatbot")
-st.markdown("Current Chat: **{}**".format(st.session_state.chat_id))
-st.markdown("---")
+# --- Title ---
+st.markdown('<div class="title-custom">رفيق</div>', unsafe_allow_html=True)
 
-if st.session_state.chat_id not in st.session_state.chat_history:
-    st.session_state.chat_history[st.session_state.chat_id] = []
+# --- Show Chat History ---
+chat_history = st.session_state.chats[st.session_state.current_chat]
+for msg in chat_history:
+    role_class = "chat-user" if msg["role"] == "user" else "chat-bot"
+    st.markdown(f"<div class='chat-bubble {role_class}'>{msg['content']}</div>", unsafe_allow_html=True)
 
-for msg in st.session_state.chat_history[st.session_state.chat_id]:
-    with st.chat_message("user"):
-        st.markdown(msg["user"])
-    with st.chat_message("assistant"):
-        st.markdown(msg["assistant"])
+# --- Input ---
+user_input = st.chat_input("✍️ اكتب سؤالك هنا...")
 
-# Prompt box
-prompt = st.chat_input("اكتب سؤالك هنا / Ask your question here")
+if user_input:
+    # Append and show user message
+    st.session_state.chats[st.session_state.current_chat].append({"role": "user", "content": user_input})
+    st.markdown(f"<div class='chat-bubble chat-user'>{user_input}</div>", unsafe_allow_html=True)
 
-# Encoding wrapper
-def encode_prompt(prompt):
-    chat_prompt = f"[INST] {prompt.strip()} [/INST]"
-    return tokenizer(chat_prompt, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    # Answer generation
+    with st.spinner("🔍 جاري توليد الإجابة..."):
+        index, docs = load_faiss_and_docs()
+        embedder = load_embedder()
+        model, tokenizer = load_model()
+        answer = ask(user_input, index, docs, embedder, model, tokenizer)
 
-if prompt:
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-
-        inputs = encode_prompt(prompt)
-        outputs = model.generate(**inputs, max_new_tokens=512, do_sample=True, top_p=0.95, temperature=0.7)
-        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        full_response = decoded.split("[/INST]")[-1].strip()
-
-        message_placeholder.markdown(full_response)
-
-    st.session_state.chat_history[st.session_state.chat_id].append({
-        "user": prompt,
-        "assistant": full_response
-    })
-    save_chat_history(st.session_state.chat_history)
+    # Append and show assistant message
+    st.session_state.chats[st.session_state.current_chat].append({"role": "assistant", "content": answer})
+    st.markdown(f"<div class='chat-bubble chat-bot'>{answer}</div>", unsafe_allow_html=True)
